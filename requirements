@@ -1,0 +1,9 @@
+numpy
+scipy
+torch
+trimesh
+torchio
+diffdrr>=0.6
+Pillow
+matplotlib
+opencv-python
