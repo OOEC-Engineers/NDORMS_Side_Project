@@ -84,7 +84,7 @@ import torchio as tio
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector
+from matplotlib.widgets import Button, RectangleSelector
 import cv2
 from scipy.ndimage import binary_fill_holes
 
@@ -155,7 +155,7 @@ def detect_scale_endpoints(img_array):
 
     best = None
     if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0]:
+        for x1, y1, x2, y2 in np.asarray(lines, dtype=np.int32).reshape(-1, 4):
             dx = float(x2 - x1)
             dy = float(y2 - y1)
             length = float(np.hypot(dx, dy))
@@ -2354,7 +2354,14 @@ def preview_initial_alignment(renderer, target, init_params, device, out_dir,
         title="Initial STL Spatial Position\nattenuation + full wireframe",
     )
 
-    plt.tight_layout()
+    if show_window and ask_to_continue:
+        fig.subplots_adjust(bottom=0.17)
+        fig.suptitle(
+            "Check the initial STL position. Continue only if this starting point is OK.",
+            fontsize=13,
+        )
+    else:
+        plt.tight_layout()
     preview_path = os.path.join(out_dir, "initial_alignment.png")
     fig.savefig(preview_path, dpi=150, bbox_inches="tight")
     print(f"[INFO] Saved initial alignment preview: {preview_path}")
@@ -2366,13 +2373,41 @@ def preview_initial_alignment(renderer, target, init_params, device, out_dir,
             print("[WARN] The active Matplotlib backend cannot open a window.")
             print(f"       Inspect {preview_path} to check the initial alignment.")
         else:
-            print("[INFO] Inspect the initial overlay, then close the window.")
+            decision = {"continue": True}
+            buttons = []
+            if ask_to_continue:
+                continue_ax = fig.add_axes([0.39, 0.035, 0.10, 0.055])
+                stop_ax = fig.add_axes([0.51, 0.035, 0.10, 0.055])
+                continue_button = Button(continue_ax, "Continue")
+                stop_button = Button(stop_ax, "Stop")
+
+                def accept(_event=None):
+                    decision["continue"] = True
+                    plt.close(fig)
+
+                def reject(_event=None):
+                    decision["continue"] = False
+                    plt.close(fig)
+
+                def on_key(event):
+                    if event.key in ("enter", "return"):
+                        accept(event)
+                    elif event.key in ("escape", "q", "Q", "n", "N"):
+                        reject(event)
+
+                continue_button.on_clicked(accept)
+                stop_button.on_clicked(reject)
+                fig.canvas.mpl_connect("key_press_event", on_key)
+                buttons.extend([continue_button, stop_button])
+                print(
+                    "[INFO] Inspect the initial overlay, then click Continue "
+                    "or Stop."
+                )
+            else:
+                print("[INFO] Inspect the initial overlay, then close the window.")
             plt.show()
-            if ask_to_continue and sys.stdin.isatty():
-                response = input(
-                    "Continue with optimisation? [Y/n]: "
-                ).strip().lower()
-                continue_optimisation = response not in {"n", "no", "q", "quit"}
+            if ask_to_continue:
+                continue_optimisation = bool(decision["continue"])
 
     plt.close(fig)
     return continue_optimisation
