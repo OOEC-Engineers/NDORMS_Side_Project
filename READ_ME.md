@@ -1,6 +1,6 @@
 # Knee 2D–3D Registration
 
-This project was developed by **Alexandre Bédard** between **July 1st and July 3rd, 2026**. For a side project during his stay at NDORMS
+This project was developed by **Alexandre Bédard** between **July 1st and July 5th, 2026**. For a side project during his stay at NDORMS
 
 This is experimental research code. Some coding errors, numerical issues, or edge cases may still be present. The goal of this repository is to test a Python pipeline for registering a 3D knee STL model onto a 2D X-ray image.
 
