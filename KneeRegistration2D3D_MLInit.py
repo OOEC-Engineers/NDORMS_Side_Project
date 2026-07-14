@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-KneeRegistration2D3D_MLInit.py
-
-Manual-label and ML-initialisation helper for KneeRegistration2D3D_V2.py.
-
 The recommended workflow is deliberately conservative:
 
 1. Manually place each STL on the X-ray ROI with:
 
-       python KneeRegistration2D3D_MLInit.py place --xray Xray/ASIP19.jpg
+       python KneeRegistration2D3D_MLInit.py place --xray Xray/ASIP1.jpg
 
 2. Save those placements as labels.
 3. Train a small pose initialiser from those labels.
