@@ -44,6 +44,10 @@ DEFAULT_STLS = (
     "3D_files/Phase3FemurM.stl",
     "3D_files/Phase3TibiaRightB.stl",
 )
+ROTATION_SLIDER_MIN = -180.0
+ROTATION_SLIDER_MAX = 180.0
+DEFAULT_FIRST_STL_ROTATION = (0.0, 0.0, 0.0)
+DEFAULT_SECOND_STL_ROTATION = (-90.0, 0.0, 0.0)
 
 
 def disable_conflicting_matplotlib_keymaps() -> None:
@@ -62,6 +66,48 @@ def disable_conflicting_matplotlib_keymaps() -> None:
 def round_pose_value(value: float) -> float:
     """Use 0.1 resolution everywhere in the manual placement UI."""
     return round(float(value), 1)
+
+
+def slider_bounds(value: float, default_min: float, default_max: float):
+    """Return valid slider bounds that always contain the initial value."""
+    value = float(value)
+    default_min = float(default_min)
+    default_max = float(default_max)
+    if not np.isfinite([value, default_min, default_max]).all():
+        raise ValueError("Slider values and bounds must be finite")
+    if default_min >= default_max:
+        raise ValueError(
+            f"Slider minimum must be below maximum: {default_min} >= {default_max}"
+        )
+    return min(default_min, value), max(default_max, value)
+
+
+def initial_rotation_for_stl(
+    args: argparse.Namespace,
+    stl_index: int,
+) -> tuple[float, float, float]:
+    """Resolve common and optional second-STL initial rotations."""
+    raw_common = (args.init_rx, args.init_ry, args.init_rz)
+    common = tuple(
+        float(default if value is None else value)
+        for value, default in zip(raw_common, DEFAULT_FIRST_STL_ROTATION)
+    )
+    if stl_index != 1 or args.disable_second_stl_init_override:
+        return common
+
+    raw_second = (
+        args.second_init_rx,
+        args.second_init_ry,
+        args.second_init_rz,
+    )
+    if any(value is not None for value in raw_second):
+        return tuple(
+            float(common_value if value is None else value)
+            for value, common_value in zip(raw_second, common)
+        )
+    if any(value is not None for value in raw_common):
+        return common
+    return DEFAULT_SECOND_STL_ROTATION
 
 
 def load_kreg_module():
@@ -331,10 +377,50 @@ class ManualPlacementSession:
     def _slider_value(self, key: str) -> float:
         return float(self.sliders[key].val)
 
+    def expand_slider_range(
+        self,
+        key: str,
+        value: float,
+        *,
+        expand_at_boundary: bool = False,
+    ) -> None:
+        """Grow a slider range so manual placement never hits a hard stop."""
+        slider = self.sliders[key]
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(f"{key} must be a finite number")
+
+        old_min = float(slider.valmin)
+        old_max = float(slider.valmax)
+        span = max(old_max - old_min, 1.0)
+        headroom = 0.5 * span
+        expand_lower = value < old_min or (
+            expand_at_boundary and value <= old_min
+        )
+        expand_upper = value > old_max or (
+            expand_at_boundary and value >= old_max
+        )
+        if not expand_lower and not expand_upper:
+            return
+
+        new_min = min(old_min, value - headroom) if expand_lower else old_min
+        new_max = max(old_max, value + headroom) if expand_upper else old_max
+        slider.valmin = new_min
+        slider.valmax = new_max
+        if slider.orientation == "vertical":
+            slider.ax.set_ylim(new_min, new_max)
+        else:
+            slider.ax.set_xlim(new_min, new_max)
+
     def set_slider_value(self, key: str, value: float) -> None:
         slider = self.sliders[key]
-        value = round_pose_value(np.clip(float(value), slider.valmin, slider.valmax))
+        value = round_pose_value(float(value))
+        self.expand_slider_range(key, value)
         slider.set_val(value)
+
+    def on_slider_changed(self, key: str, value: float) -> None:
+        self.expand_slider_range(key, value, expand_at_boundary=True)
+        self.update()
 
     def sync_text_boxes(self) -> None:
         if self._syncing_widgets:
@@ -578,9 +664,18 @@ class ManualPlacementSession:
         self.ax = self.fig.add_axes([0.05, 0.28, 0.62, 0.68])
 
         slider_specs = [
-            ("rx", "rx deg", init_pose["rx"], -60.0, 60.0, 0.1),
-            ("ry", "ry deg", init_pose["ry"], -60.0, 60.0, 0.1),
-            ("rz", "rz deg", init_pose["rz"], -60.0, 60.0, 0.1),
+            (
+                "rx", "rx deg", init_pose["rx"],
+                ROTATION_SLIDER_MIN, ROTATION_SLIDER_MAX, 0.1,
+            ),
+            (
+                "ry", "ry deg", init_pose["ry"],
+                ROTATION_SLIDER_MIN, ROTATION_SLIDER_MAX, 0.1,
+            ),
+            (
+                "rz", "rz deg", init_pose["rz"],
+                ROTATION_SLIDER_MIN, ROTATION_SLIDER_MAX, 0.1,
+            ),
             ("tx", "tx mm", init_pose["tx"], -80.0, 80.0, 0.1),
             (
                 "ty",
@@ -594,6 +689,7 @@ class ManualPlacementSession:
         ]
         y0 = 0.82
         for index, (key, label, value, vmin, vmax, step) in enumerate(slider_specs):
+            vmin, vmax = slider_bounds(value, vmin, vmax)
             y = y0 - index * 0.075
             ax_slider = self.fig.add_axes([0.73, y, 0.16, 0.028])
             ax_text = self.fig.add_axes([0.91, y, 0.06, 0.028])
@@ -602,10 +698,14 @@ class ManualPlacementSession:
                 label,
                 valmin=float(vmin),
                 valmax=float(vmax),
-                valinit=round_pose_value(np.clip(value, vmin, vmax)),
+                valinit=round_pose_value(value),
                 valstep=step,
             )
-            self.sliders[key].on_changed(self.update)
+            self.sliders[key].on_changed(
+                lambda slider_value, slider_key=key: self.on_slider_changed(
+                    slider_key, slider_value
+                )
+            )
             self.text_boxes[key] = TextBox(
                 ax_text,
                 "",
@@ -660,6 +760,7 @@ def estimate_initial_params(
     roi_img: np.ndarray,
     stl_path: Path,
     stl_scale: float,
+    stl_center: np.ndarray,
     pixel_spacing: float,
     device: torch.device,
     args: argparse.Namespace,
@@ -679,6 +780,37 @@ def estimate_initial_params(
         device=device,
     )
     if args.init_ty is not None:
+        return base
+
+    if args.scale_length_cm is None:
+        print(
+            "[INFO] No ruler: fitting initial depth directly to the target "
+            "segmentation across the full valid depth range"
+        )
+        try:
+            base[4] = float(
+                kreg.estimate_initial_ty(
+                    renderer,
+                    roi_img,
+                    base,
+                    device,
+                    args.sdd,
+                    str(out_dir),
+                    steps=args.ty_search_steps,
+                    implant_percentile=args.implant_percentile,
+                    segment_mode=args.segment_mode,
+                    stl_path=str(stl_path),
+                    stl_scale=stl_scale,
+                    stl_center=stl_center,
+                )
+            )
+        except Exception as error:
+            fallback_ty = 0.78 * args.sdd
+            print(
+                f"[WARN] No-ruler depth fitting failed ({error}); "
+                f"using fallback ty={fallback_ty:.2f}mm"
+            )
+            base[4] = fallback_ty
         return base
 
     try:
@@ -711,6 +843,9 @@ def estimate_initial_params(
                 ty_max=ty * 1.15,
                 implant_percentile=args.implant_percentile,
                 segment_mode=args.segment_mode,
+                stl_path=str(stl_path),
+                stl_scale=stl_scale,
+                stl_center=stl_center,
             )
         except Exception as error:
             print(f"[WARN] Narrow depth sweep failed; using closed-form ty ({error})")
@@ -732,7 +867,11 @@ def command_place(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.scale_points is not None and args.scale_length_cm is None:
+        raise ValueError("--scale_points requires --scale_length_cm")
     if args.scale_length_cm is not None:
+        if args.scale_length_cm <= 0.0:
+            raise ValueError("--scale_length_cm must be positive")
         pixel_spacing = kreg.calibrate_pixel_spacing(
             xray_np,
             args.scale_length_cm,
@@ -741,6 +880,14 @@ def command_place(args: argparse.Namespace) -> None:
         )
     else:
         pixel_spacing = float(args.pixel_spacing)
+        if pixel_spacing <= 0.0:
+            raise ValueError(
+                "--pixel_spacing must be positive when no scale ruler is provided"
+            )
+        print(
+            "[INFO] No X-ray ruler calibration: using configured detector "
+            f"pixel spacing {pixel_spacing:.6f} mm/pixel"
+        )
 
     device = torch.device(args.device)
     stls = [Path(path) for path in (args.stls or DEFAULT_STLS)]
@@ -774,30 +921,34 @@ def command_place(args: argparse.Namespace) -> None:
             silhouette_blur_sigma=args.silhouette_blur_sigma,
         )
         stl_out_dir = out_dir / "_initial_depth" / stl_name
-        original_init_rotation = (args.init_rx, args.init_ry, args.init_rz)
-        if stl_index == 1 and not args.disable_second_stl_init_override:
-            args.init_rx = args.second_init_rx
-            args.init_ry = args.second_init_ry
-            args.init_rz = args.second_init_rz
+        stl_args = argparse.Namespace(**vars(args))
+        initial_rotation = initial_rotation_for_stl(args, stl_index)
+        stl_args.init_rx, stl_args.init_ry, stl_args.init_rz = initial_rotation
+        common_rotation = tuple(
+            float(default if value is None else value)
+            for value, default in zip(
+                (args.init_rx, args.init_ry, args.init_rz),
+                DEFAULT_FIRST_STL_ROTATION,
+            )
+        )
+        if stl_index == 1 and initial_rotation != common_rotation:
             print(
                 "[INFO] STL #2 initial rotation override: "
-                f"rx={args.init_rx:+.1f}, ry={args.init_ry:+.1f}, "
-                f"rz={args.init_rz:+.1f} deg"
+                f"rx={stl_args.init_rx:+.1f}, ry={stl_args.init_ry:+.1f}, "
+                f"rz={stl_args.init_rz:+.1f} deg"
             )
-        try:
-            init_params = estimate_initial_params(
-                kreg=kreg,
-                renderer=renderer,
-                roi_img=roi_img,
-                stl_path=stl_path,
-                stl_scale=args.stl_scale,
-                pixel_spacing=pixel_spacing,
-                device=device,
-                args=args,
-                out_dir=stl_out_dir,
-            )
-        finally:
-            args.init_rx, args.init_ry, args.init_rz = original_init_rotation
+        init_params = estimate_initial_params(
+            kreg=kreg,
+            renderer=renderer,
+            roi_img=roi_img,
+            stl_path=stl_path,
+            stl_scale=args.stl_scale,
+            stl_center=stl_center,
+            pixel_spacing=pixel_spacing,
+            device=device,
+            args=stl_args,
+            out_dir=stl_out_dir,
+        )
 
         session = ManualPlacementSession(
             kreg=kreg,
@@ -811,7 +962,7 @@ def command_place(args: argparse.Namespace) -> None:
             target=target,
             init_params=init_params,
             device=device,
-            args=args,
+            args=stl_args,
             pixel_spacing=pixel_spacing,
             diagnostic_dir=out_dir,
         )
@@ -1049,29 +1200,33 @@ def add_common_placement_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--silhouette_threshold", type=float, default=0.01)
     parser.add_argument("--silhouette_blur_sigma", type=float, default=1.5)
     parser.add_argument("--ty_search_steps", type=int, default=13)
-    parser.add_argument("--init_rx", type=float, default=0.0)
-    parser.add_argument("--init_ry", type=float, default=0.0)
-    parser.add_argument("--init_rz", type=float, default=0.0)
+    parser.add_argument("--init_rx", type=float, default=None,
+                        help="Common initial rx in degrees (default: 0)")
+    parser.add_argument("--init_ry", type=float, default=None,
+                        help="Common initial ry in degrees (default: 0)")
+    parser.add_argument("--init_rz", type=float, default=None,
+                        help="Common initial rz in degrees (default: 0)")
     parser.add_argument("--init_tx", type=float, default=0.0)
     parser.add_argument("--init_ty", type=float, default=None)
     parser.add_argument("--init_tz", type=float, default=0.0)
     parser.add_argument(
         "--second_init_rx",
         type=float,
-        default=-90.0,
-        help="Initial rx for the second STL placed in one 'place' run",
+        default=None,
+        help=("Optional second-STL rx override. With no explicit common or "
+              "second-STL rotation, the historical default is -90 degrees."),
     )
     parser.add_argument(
         "--second_init_ry",
         type=float,
-        default=0.0,
-        help="Initial ry for the second STL placed in one 'place' run",
+        default=None,
+        help="Optional second-STL ry override (otherwise inherit common ry)",
     )
     parser.add_argument(
         "--second_init_rz",
         type=float,
-        default=0.0,
-        help="Initial rz for the second STL placed in one 'place' run",
+        default=None,
+        help="Optional second-STL rz override (otherwise inherit common rz)",
     )
     parser.add_argument(
         "--disable_second_stl_init_override",

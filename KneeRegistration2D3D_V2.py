@@ -1171,26 +1171,215 @@ def _bbox_mismatch(projected_bbox, target_bbox, image_shape):
         np.hypot(target_bbox["long_side_px"], target_bbox["short_side_px"]), 1.0
     )
 
-    px, py, pw, ph = projected_bbox["bbox_xywh"]
     height, width = image_shape
-    clipped = px <= 0 or py <= 0 or px + pw >= width or py + ph >= height
+    corners = np.asarray(projected_bbox["corners_xy"], dtype=np.float64)
+    clipped = (
+        corners[:, 0].min() < -0.5
+        or corners[:, 1].min() < -0.5
+        or corners[:, 0].max() > width - 0.5
+        or corners[:, 1].max() > height - 0.5
+    )
     clipping_penalty = 0.5 if clipped else 0.0
     return float(size_error + 0.20 * center_error + clipping_penalty)
 
 
+def _projected_points_box(points_xy):
+    """Return an oriented box for projected vertices, including off-image ones."""
+    points_xy = np.asarray(points_xy, dtype=np.float64)
+    if points_xy.ndim != 2 or points_xy.shape[1] != 2:
+        raise ValueError("Projected STL points must have shape (N, 2)")
+    points_xy = points_xy[np.isfinite(points_xy).all(axis=1)]
+    if len(points_xy) < 3:
+        return None
+
+    contour = np.ascontiguousarray(points_xy.astype(np.float32)).reshape(-1, 1, 2)
+    rect = cv2.minAreaRect(contour)
+    (center_x, center_y), (box_width, box_height), _ = rect
+    if box_width <= 1e-6 or box_height <= 1e-6:
+        return None
+
+    corners = cv2.boxPoints(rect).astype(np.float64)
+    edge_vectors = np.roll(corners, -1, axis=0) - corners
+    edge_lengths = np.linalg.norm(edge_vectors, axis=1)
+    long_edge = edge_vectors[int(np.argmax(edge_lengths))]
+    angle_deg = float(np.degrees(np.arctan2(long_edge[1], long_edge[0])))
+    x0 = int(np.floor(points_xy[:, 0].min()))
+    x1 = int(np.ceil(points_xy[:, 0].max()))
+    y0 = int(np.floor(points_xy[:, 1].min()))
+    y1 = int(np.ceil(points_xy[:, 1].max()))
+
+    return {
+        "bbox_xywh": (x0, y0, max(1, x1 - x0), max(1, y1 - y0)),
+        "center_xy": np.array([center_x, center_y], dtype=np.float64),
+        "corners_xy": corners,
+        "long_side_px": float(max(box_width, box_height)),
+        "short_side_px": float(min(box_width, box_height)),
+        "angle_deg": angle_deg,
+    }
+
+
+def _load_centered_stl_vertices(stl_path, stl_scale, stl_center):
+    """Load STL vertices in the centred world coordinates used by DiffDRR."""
+    mesh = trimesh.load(stl_path, force="mesh")
+    if stl_scale != 1.0:
+        mesh.apply_scale(stl_scale)
+    return (
+        np.asarray(mesh.vertices, dtype=np.float64)
+        - np.asarray(stl_center, dtype=np.float64)
+    )
+
+
+def _project_centered_vertices(vertices_world, params, renderer):
+    """Project centred STL vertices without clipping them to the detector."""
+    from diffdrr.pose import convert
+
+    angles_zyx = torch.stack((params[2], params[1], params[0])).unsqueeze(0)
+    translation = params[3:].unsqueeze(0)
+    pose = convert(
+        angles_zyx,
+        translation,
+        parameterization="euler_angles",
+        convention="ZYX",
+    )
+    with torch.no_grad():
+        source, detector_targets = renderer.detector(pose, calibration=None)
+    source = source[0, 0].detach().cpu().numpy().astype(np.float64)
+    detector_grid = (
+        detector_targets[0]
+        .reshape(renderer.detector.height, renderer.detector.width, 3)
+        .detach().cpu().numpy().astype(np.float64)
+    )
+
+    detector_origin = detector_grid[0, 0]
+    row_step = detector_grid[1, 0] - detector_origin
+    column_step = detector_grid[0, 1] - detector_origin
+    plane_normal = np.cross(row_step, column_step)
+    rays = np.asarray(vertices_world, dtype=np.float64) - source
+    denominator = rays @ plane_normal
+    numerator = float(np.dot(detector_origin - source, plane_normal))
+    valid = np.abs(denominator) > 1e-12
+    ray_scale = np.zeros_like(denominator)
+    ray_scale[valid] = numerator / denominator[valid]
+    valid &= ray_scale > 0.0
+    intersections = source + ray_scale[:, None] * rays
+    offsets = intersections - detector_origin
+    pixel_y = (offsets @ row_step) / np.dot(row_step, row_step)
+    pixel_x = (offsets @ column_step) / np.dot(column_step, column_step)
+    projected = np.column_stack((pixel_x, pixel_y))
+    valid &= np.isfinite(projected).all(axis=1)
+    return projected, valid
+
+
+def _full_projected_stl_box(vertices_world, params, renderer):
+    """Measure the complete STL projection, even beyond the ROI boundary."""
+    projected, valid = _project_centered_vertices(
+        vertices_world, params, renderer
+    )
+    return _projected_points_box(projected[valid])
+
+
+def _depth_target_box(roi_img, segment_mode, implant_percentile):
+    """Prefer a segmented target box, with an inset ROI fallback."""
+    try:
+        diagnostic = build_segmentation_diagnostic(
+            roi_img, segment_mode, implant_percentile
+        )
+        return diagnostic["box"], diagnostic["label"], "segmentation"
+    except Exception as error:
+        height, width = roi_img.shape
+        margin_x = int(round(0.05 * width)) if width >= 20 else 0
+        margin_y = int(round(0.05 * height)) if height >= 20 else 0
+        fallback_box = _box_from_bbox(
+            (
+                margin_x,
+                margin_y,
+                max(1, width - 2 * margin_x),
+                max(1, height - 2 * margin_y),
+            )
+        )
+        print(
+            "[WARN] Target segmentation unavailable for depth fitting "
+            f"({error}); fitting the STL silhouette inside the ROI instead"
+        )
+        return fallback_box, "ROI inset fallback", "roi_fallback"
+
+
+def estimate_no_ruler_pixel_spacing(
+    renderer,
+    roi_img,
+    base_params,
+    device,
+    pixel_spacing,
+    stl_path,
+    stl_scale,
+    stl_center,
+    implant_percentile=80.0,
+    segment_mode="bone",
+):
+    """Infer an image-fit spacing so a nominal-depth silhouette fits its target.
+
+    This resolves the visual scale/depth ambiguity when no physical ruler is
+    available. The result is an effective fitting parameter, not a physical
+    detector calibration.
+    """
+    target_box, target_label, target_source = _depth_target_box(
+        roi_img, segment_mode, implant_percentile
+    )
+    vertices_world = _load_centered_stl_vertices(
+        stl_path, stl_scale, stl_center
+    )
+    projected_box = _full_projected_stl_box(
+        vertices_world, base_params, renderer
+    )
+    if projected_box is None:
+        raise RuntimeError("Nominal-depth pose produced no projectable STL vertices")
+
+    long_ratio = projected_box["long_side_px"] / max(
+        target_box["long_side_px"], 1e-6
+    )
+    short_ratio = projected_box["short_side_px"] / max(
+        target_box["short_side_px"], 1e-6
+    )
+    raw_factor = float(np.sqrt(long_ratio * short_ratio))
+    if not np.isfinite(raw_factor) or raw_factor <= 0.0:
+        raise RuntimeError(f"Invalid no-ruler image-fit scale factor {raw_factor}")
+    scale_factor = float(np.clip(raw_factor, 0.25, 4.0))
+    inferred_spacing = float(pixel_spacing) * scale_factor
+    print(
+        "[INFO] No-ruler image fit: effective pixel spacing "
+        f"{float(pixel_spacing):.6f} -> {inferred_spacing:.6f} mm/pixel "
+        f"(size factor={scale_factor:.4f}; not a physical calibration)"
+    )
+    return inferred_spacing, {
+        "input_pixel_spacing_mm": float(pixel_spacing),
+        "effective_pixel_spacing_mm": inferred_spacing,
+        "scale_factor": scale_factor,
+        "unclipped_scale_factor": raw_factor,
+        "nominal_ty_mm": float(base_params[4].item()),
+        "target_box_source": target_source,
+        "target_box_label": target_label,
+        "target_box": _serialise_box(target_box),
+        "projected_box_before_rescale": _serialise_box(projected_box),
+        "warning": (
+            "Effective image-fit spacing only; no physical ruler calibration "
+            "was available."
+        ),
+    }
+
+
 def estimate_initial_ty(renderer, roi_img, base_params, device, sdd, out_dir,
                         steps=13, ty_min=None, ty_max=None,
-                        implant_percentile=80.0, segment_mode="bone"):
+                        implant_percentile=80.0, segment_mode="bone",
+                        stl_path=None, stl_scale=1.0, stl_center=None):
     """Choose ty whose STL silhouette box best matches the bone/implant ROI box."""
-    if segment_mode == "bone":
-        _, target_mask = segment_bone_bbox(roi_img)
-    else:
-        _, target_mask = segment_implant_bbox(
-            roi_img, percentile=implant_percentile
+    target_bbox, target_label, target_source = _depth_target_box(
+        roi_img, segment_mode, implant_percentile
+    )
+    vertices_world = None
+    if stl_path is not None and stl_center is not None:
+        vertices_world = _load_centered_stl_vertices(
+            stl_path, stl_scale, stl_center
         )
-    target_bbox = _mask_box(target_mask)
-    if target_bbox is None:
-        raise RuntimeError("Could not compute a target bounding box from the ROI mask")
 
     if ty_min is None:
         ty_min = 0.65 * sdd
@@ -1215,9 +1404,14 @@ def estimate_initial_ty(renderer, roi_img, base_params, device, sdd, out_dir,
             silhouette = render_drr(renderer, params, device)
             silhouette_np = silhouette.detach().cpu().numpy()
             maximum = float(np.max(silhouette_np))
-            projected_bbox = _mask_box(
-                silhouette_np > max(0.5 * maximum, 1e-6)
-            )
+            if vertices_world is not None:
+                projected_bbox = _full_projected_stl_box(
+                    vertices_world, params, renderer
+                )
+            else:
+                projected_bbox = _mask_box(
+                    silhouette_np > max(0.5 * maximum, 1e-6)
+                )
             if projected_bbox is None:
                 score = float("inf")
             else:
@@ -1240,13 +1434,12 @@ def estimate_initial_ty(renderer, roi_img, base_params, device, sdd, out_dir,
     best_bbox = projected_boxes[best_index]
     best_silhouette = silhouettes[best_index]
     print(f"[INFO] Automatic initial ty selected: {best_ty:.3f} mm")
-    target_label = "Bone target" if segment_mode == "bone" else "Implant target"
 
     os.makedirs(out_dir, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(17, 5))
     axes[0].imshow(roi_img, cmap="gray")
     _draw_box(axes[0], target_bbox, color="lime", linewidth=2.2)
-    axes[0].set_title("Segmented Target Box (oriented)")
+    axes[0].set_title(f"Depth target: {target_label}")
     axes[0].axis("off")
 
     axes[1].plot(candidates, scores, "o-", color="tab:blue")
@@ -1261,7 +1454,9 @@ def estimate_initial_ty(renderer, roi_img, base_params, device, sdd, out_dir,
     axes[2].imshow(visible, cmap="magma", alpha=0.45)
     _draw_box(axes[2], best_bbox, color="cyan", linewidth=2.2)
     _draw_box(axes[2], target_bbox, color="lime", linewidth=2.2)
-    axes[2].set_title(f"Selected silhouette: cyan\n{target_label}: green")
+    axes[2].set_xlim(-0.5, roi_img.shape[1] - 0.5)
+    axes[2].set_ylim(roi_img.shape[0] - 0.5, -0.5)
+    axes[2].set_title(f"Full STL projection: cyan\n{target_label}: green")
     axes[2].axis("off")
 
     fig.tight_layout()
@@ -1271,8 +1466,13 @@ def estimate_initial_ty(renderer, roi_img, base_params, device, sdd, out_dir,
 
     data = {
         "selected_ty_mm": best_ty,
+        "target_box_source": target_source,
+        "target_box_label": target_label,
         "target_box": _serialise_box(target_bbox),
         "selected_silhouette_box": _serialise_box(best_bbox),
+        "projected_box_measurement": (
+            "full_stl_vertices" if vertices_world is not None else "clipped_drr"
+        ),
         "implant_threshold_percentile": float(implant_percentile),
         "candidates_ty_mm": candidates.tolist(),
         "bbox_mismatch_scores": [
@@ -2460,7 +2660,13 @@ def show_warm_start_diagnostic(renderer, target, params, device,
 
 
 def compute_pose_outputs(params, renderer, stl_center):
-    """Return camera and model transforms with explicit coordinate direction."""
+    """Return model transforms with explicit coordinate direction.
+
+    DiffDRR optimises a camera pose around a centred STL volume. For reporting,
+    also expose a screen-centred frame whose origin is the middle of the
+    detector/image plane, so the translation does not depend on the STL file's
+    original coordinate origin.
+    """
     from diffdrr.pose import convert
     from scipy.spatial.transform import Rotation as SciPyRotation
 
@@ -2486,7 +2692,44 @@ def compute_pose_outputs(params, renderer, stl_center):
     )
     stl_to_camera = torch.linalg.inv(camera_to_centered_stl) @ stl_to_centered
 
+    with torch.no_grad():
+        _source, detector_targets = renderer.detector(
+            convert(
+                angles_zyx,
+                translation,
+                parameterization="euler_angles",
+                convention="ZYX",
+            ),
+            calibration=None,
+        )
+    detector_grid = detector_targets[0].reshape(
+        renderer.detector.height,
+        renderer.detector.width,
+        3,
+    )
+    detector_center_world = detector_grid.reshape(-1, 3).mean(dim=0)
+    world_to_camera = torch.linalg.inv(camera_to_centered_stl)
+    detector_center_h = torch.cat(
+        (
+            detector_center_world.to(device=params.device, dtype=params.dtype),
+            torch.ones(1, device=params.device, dtype=params.dtype),
+        )
+    )
+    detector_center_camera = (world_to_camera @ detector_center_h)[:3]
+
+    camera_to_screen_centered = torch.eye(
+        4, device=params.device, dtype=params.dtype
+    )
+    camera_to_screen_centered[:3, 3] = -detector_center_camera
+    centered_stl_to_screen_centered = camera_to_screen_centered @ world_to_camera
+    stl_to_screen_centered = camera_to_screen_centered @ stl_to_camera
+
+    centered_stl_to_screen_centered_np = (
+        centered_stl_to_screen_centered.detach().cpu().numpy()
+    )
     stl_to_camera_np = stl_to_camera.detach().cpu().numpy()
+    stl_to_screen_centered_np = stl_to_screen_centered.detach().cpu().numpy()
+    detector_center_camera_np = detector_center_camera.detach().cpu().numpy()
     model_xyz_deg = SciPyRotation.from_matrix(
         stl_to_camera_np[:3, :3]
     ).as_euler("xyz", degrees=True)
@@ -2494,6 +2737,9 @@ def compute_pose_outputs(params, renderer, stl_center):
     return (
         camera_to_centered_stl.detach().cpu().numpy(),
         stl_to_camera_np,
+        centered_stl_to_screen_centered_np,
+        stl_to_screen_centered_np,
+        detector_center_camera_np,
         model_xyz_deg,
     )
 
@@ -2733,9 +2979,14 @@ def save_results(params, optimized_params, optimized_ncc, saved_pose_ncc,
                  segmentation_diagnostic=None):
     """Save comparison image, DRR, and pose JSON."""
     os.makedirs(out_dir, exist_ok=True)
-    camera_to_centered_stl, stl_to_camera, model_xyz_deg = compute_pose_outputs(
-        params, renderer, stl_center
-    )
+    (
+        camera_to_centered_stl,
+        stl_to_camera,
+        centered_stl_to_screen_centered,
+        stl_to_screen_centered,
+        detector_center_camera,
+        model_xyz_deg,
+    ) = compute_pose_outputs(params, renderer, stl_center)
     wire_segments = project_stl_wireframe(
         stl_path, stl_scale, params, renderer, stl_center
     )
@@ -2880,6 +3131,52 @@ def save_results(params, optimized_params, optimized_ncc, saved_pose_ncc,
                 "DiffDRR camera coordinates (source at origin, detector along +Z)"
             ),
         },
+        "stl_to_screen_centered": {
+            "rotation_xyz_deg": {
+                "rx": float(model_xyz_deg[0]),
+                "ry": float(model_xyz_deg[1]),
+                "rz": float(model_xyz_deg[2]),
+            },
+            "rotation_matrix_3x3": stl_to_screen_centered[:3, :3].tolist(),
+            "translation_mm": {
+                "tx": float(stl_to_screen_centered[0, 3]),
+                "ty": float(stl_to_screen_centered[1, 3]),
+                "tz": float(stl_to_screen_centered[2, 3]),
+            },
+            "matrix_4x4": stl_to_screen_centered.tolist(),
+            "detector_center_in_camera_mm": [
+                float(value) for value in detector_center_camera
+            ],
+            "description": (
+                "Rigid transform from original STL coordinates to a "
+                "screen-centred coordinate frame. Origin (0, 0, 0) is the "
+                "middle of the detector/image plane; axes match DiffDRR camera "
+                "coordinates, with +Z from X-ray source toward detector."
+            ),
+        },
+        "centered_stl_to_screen_centered": {
+            "rotation_xyz_deg": {
+                "rx": float(model_xyz_deg[0]),
+                "ry": float(model_xyz_deg[1]),
+                "rz": float(model_xyz_deg[2]),
+            },
+            "rotation_matrix_3x3": centered_stl_to_screen_centered[
+                :3, :3
+            ].tolist(),
+            "translation_mm": {
+                "tx": float(centered_stl_to_screen_centered[0, 3]),
+                "ty": float(centered_stl_to_screen_centered[1, 3]),
+                "tz": float(centered_stl_to_screen_centered[2, 3]),
+            },
+            "matrix_4x4": centered_stl_to_screen_centered.tolist(),
+            "description": (
+                "Teacher-friendly 6-DoF pose. Source origin is the centred "
+                "STL/object origin used by DiffDRR, not the STL file's CAD "
+                "origin. Destination origin (0, 0, 0) is the middle of the "
+                "detector/image plane, so the translation is independent of "
+                "where the STL file originally started."
+            ),
+        },
         "stl_center_mm": [float(value) for value in stl_center],
         "final_rx_offset_deg": float(final_rx_offset_deg),
         "optimized_ncc": float(optimized_ncc),
@@ -2916,7 +3213,18 @@ def save_results(params, optimized_params, optimized_ncc, saved_pose_ncc,
         json.dump(pose_data, f, indent=2)
     print(f"[INFO] Saved pose JSON: {json_path}")
 
-    return rx_deg, ry_deg, rz_deg, tx, ty, tz, stl_to_camera, model_xyz_deg
+    return (
+        rx_deg,
+        ry_deg,
+        rz_deg,
+        tx,
+        ty,
+        tz,
+        stl_to_camera,
+        centered_stl_to_screen_centered,
+        stl_to_screen_centered,
+        model_xyz_deg,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2955,6 +3263,15 @@ def main():
         metavar=("X1", "Y1", "X2", "Y2"),
         default=None,
         help="Optional repeatable scale endpoints; requires --scale_length_cm",
+    )
+    parser.add_argument(
+        "--auto_fit_no_ruler",
+        action="store_true",
+        help=(
+            "Without a ruler, infer an effective image-fit pixel spacing at a "
+            "nominal valid depth, then fit ty to segmentation/ROI. The inferred "
+            "spacing is not a physical calibration."
+        ),
     )
     parser.add_argument(
         "--projection_mode",
@@ -3144,6 +3461,10 @@ def main():
         parser.error("--scale_length_cm must be positive")
     if args.scale_points is not None and args.scale_length_cm is None:
         parser.error("--scale_points requires --scale_length_cm")
+    if args.scale_length_cm is None and args.pixel_spacing <= 0.0:
+        parser.error(
+            "--pixel_spacing must be positive when no scale ruler is provided"
+        )
     if args.translation_lr <= 0.0:
         parser.error("--translation_lr must be positive")
     if args.ty_search_steps < 3:
@@ -3200,6 +3521,22 @@ def main():
             args.scale_length_cm,
             args.out_dir,
             points=args.scale_points,
+        )
+    else:
+        # Reusing an output directory must not make a no-ruler run appear to
+        # have performed physical scale calibration. These two files are
+        # generated artifacts, so remove stale copies from an earlier run.
+        for filename in ("scale_calibration.png", "scale_calibration.json"):
+            stale_path = os.path.join(args.out_dir, filename)
+            if os.path.isfile(stale_path):
+                os.remove(stale_path)
+                print(
+                    "[INFO] Removed stale ruler-calibration artifact from "
+                    f"a previous run: {stale_path}"
+                )
+        print(
+            "[INFO] No X-ray ruler calibration: using configured detector "
+            f"pixel spacing {effective_pixel_spacing:.6f} mm/pixel"
         )
 
     if args.roi is not None:
@@ -3290,37 +3627,50 @@ def main():
         device=device,
     )
 
-    if initial_ty is None:
-        # Try closed-form ty from magnification ratio first (Solution 2A)
+    if (
+        initial_ty is None
+        and args.scale_length_cm is None
+        and args.auto_fit_no_ruler
+    ):
         try:
-            if args.segment_mode == "bone":
-                bone_bbox, bone_mask = segment_bone_bbox(roi_img)
-            else:
-                bone_bbox, bone_mask = segment_implant_bbox(
-                    roi_img, percentile=args.implant_percentile
-                )
-            target_box = _mask_box(bone_mask)
-            if target_box is None:
-                target_box = _box_from_bbox(bone_bbox)
-            initial_ty = closed_form_ty(
-                args.stl, args.stl_scale,
-                target_box, effective_pixel_spacing, args.sdd
+            effective_pixel_spacing, no_ruler_fit = estimate_no_ruler_pixel_spacing(
+                renderer,
+                roi_img,
+                base_params,
+                device,
+                effective_pixel_spacing,
+                args.stl,
+                args.stl_scale,
+                stl_center,
+                implant_percentile=args.implant_percentile,
+                segment_mode=args.segment_mode,
             )
-            # Refine with a narrow sweep around the closed-form estimate
-            try:
-                initial_ty = estimate_initial_ty(
-                    renderer, roi_img, base_params, device, args.sdd,
-                    args.out_dir,
-                    steps=args.ty_search_steps,
-                    ty_min=initial_ty * 0.85,
-                    ty_max=initial_ty * 1.15,
-                    implant_percentile=args.implant_percentile,
-                    segment_mode=args.segment_mode,
-                )
-            except Exception:
-                pass  # closed-form estimate is good enough
+            renderer = build_renderer(
+                volume, affine, args.sdd, effective_pixel_spacing,
+                detector_height, detector_width, device,
+                projection_mode=args.projection_mode,
+                silhouette_threshold=args.silhouette_threshold,
+                silhouette_blur_sigma=args.silhouette_blur_sigma,
+            )
+            os.makedirs(args.out_dir, exist_ok=True)
+            no_ruler_fit_path = os.path.join(
+                args.out_dir, "no_ruler_image_fit.json"
+            )
+            with open(no_ruler_fit_path, "w") as f:
+                json.dump(no_ruler_fit, f, indent=2)
+            print(f"[INFO] Saved no-ruler image-fit data: {no_ruler_fit_path}")
         except Exception as error:
-            print(f"[WARN] Closed-form ty failed ({error}); using full sweep")
+            print(
+                "[WARN] Could not infer no-ruler image-fit spacing "
+                f"({error}); continuing with configured pixel spacing"
+            )
+
+    if initial_ty is None:
+        if args.scale_length_cm is None:
+            print(
+                "[INFO] No ruler: fitting initial depth directly to the target "
+                "segmentation across the full valid depth range"
+            )
             try:
                 initial_ty = estimate_initial_ty(
                     renderer, roi_img, base_params, device, args.sdd,
@@ -3330,13 +3680,68 @@ def main():
                     ty_max=args.ty_search_max,
                     implant_percentile=args.implant_percentile,
                     segment_mode=args.segment_mode,
+                    stl_path=args.stl,
+                    stl_scale=args.stl_scale,
+                    stl_center=stl_center,
                 )
-            except Exception as error2:
+            except Exception as error:
                 initial_ty = 0.85 * args.sdd
                 print(
-                    f"[WARN] ty estimation failed ({error2}); "
+                    f"[WARN] No-ruler depth fitting failed ({error}); "
                     f"fallback ty={initial_ty:.3f} mm"
                 )
+        else:
+            # With a ruler, seed depth from physical magnification and refine it.
+            try:
+                if args.segment_mode == "bone":
+                    bone_bbox, bone_mask = segment_bone_bbox(roi_img)
+                else:
+                    bone_bbox, bone_mask = segment_implant_bbox(
+                        roi_img, percentile=args.implant_percentile
+                    )
+                target_box = _mask_box(bone_mask)
+                if target_box is None:
+                    target_box = _box_from_bbox(bone_bbox)
+                initial_ty = closed_form_ty(
+                    args.stl, args.stl_scale,
+                    target_box, effective_pixel_spacing, args.sdd
+                )
+                try:
+                    initial_ty = estimate_initial_ty(
+                        renderer, roi_img, base_params, device, args.sdd,
+                        args.out_dir,
+                        steps=args.ty_search_steps,
+                        ty_min=initial_ty * 0.85,
+                        ty_max=initial_ty * 1.15,
+                        implant_percentile=args.implant_percentile,
+                        segment_mode=args.segment_mode,
+                        stl_path=args.stl,
+                        stl_scale=args.stl_scale,
+                        stl_center=stl_center,
+                    )
+                except Exception:
+                    pass  # closed-form estimate is good enough
+            except Exception as error:
+                print(f"[WARN] Closed-form ty failed ({error}); using full sweep")
+                try:
+                    initial_ty = estimate_initial_ty(
+                        renderer, roi_img, base_params, device, args.sdd,
+                        args.out_dir,
+                        steps=args.ty_search_steps,
+                        ty_min=args.ty_search_min,
+                        ty_max=args.ty_search_max,
+                        implant_percentile=args.implant_percentile,
+                        segment_mode=args.segment_mode,
+                        stl_path=args.stl,
+                        stl_scale=args.stl_scale,
+                        stl_center=stl_center,
+                    )
+                except Exception as error2:
+                    initial_ty = 0.85 * args.sdd
+                    print(
+                        f"[WARN] ty estimation failed ({error2}); "
+                        f"fallback ty={initial_ty:.3f} mm"
+                    )
     else:
         print(
             f"[INFO] Manual --init_ty override: {initial_ty:.3f} mm "
@@ -3442,7 +3847,18 @@ def main():
     detail_drr_np = final_detail_drr.detach().cpu().numpy()
 
     # --- Save results ---
-    rx, ry, rz, tx, ty, tz, stl_to_camera, model_xyz_deg = save_results(
+    (
+        rx,
+        ry,
+        rz,
+        tx,
+        ty,
+        tz,
+        stl_to_camera,
+        centered_stl_to_screen_centered,
+        stl_to_screen_centered,
+        model_xyz_deg,
+    ) = save_results(
         final_params, best_params, optimized_ncc, saved_pose_ncc,
         args.final_rx_offset_deg, target_np, drr_np, detail_drr_np,
         args.out_dir, renderer, stl_center, args.stl, args.stl_scale,
@@ -3483,6 +3899,16 @@ def main():
     print(f"  Translation tx = {stl_to_camera[0, 3]:+.3f} mm")
     print(f"              ty = {stl_to_camera[1, 3]:+.3f} mm")
     print(f"              tz = {stl_to_camera[2, 3]:+.3f} mm")
+    print("=" * 60)
+    print("  CENTRED-STL/OBJECT -> SCREEN-CENTRED 6-DOF POSE")
+    print("  Origin (0,0,0) = middle of detector/image plane")
+    print("=" * 60)
+    print(f"  Rotation  rx = {model_xyz_deg[0]:+.3f} deg")
+    print(f"            ry = {model_xyz_deg[1]:+.3f} deg")
+    print(f"            rz = {model_xyz_deg[2]:+.3f} deg")
+    print(f"  Translation tx = {centered_stl_to_screen_centered[0, 3]:+.3f} mm")
+    print(f"              ty = {centered_stl_to_screen_centered[1, 3]:+.3f} mm")
+    print(f"              tz = {centered_stl_to_screen_centered[2, 3]:+.3f} mm")
     print("  Full rotation and homogeneous matrices are in optimal_pose.json")
     print("=" * 60)
     print(f"\n  Results saved to: {args.out_dir}/")

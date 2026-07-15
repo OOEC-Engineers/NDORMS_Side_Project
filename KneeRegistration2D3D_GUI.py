@@ -33,6 +33,14 @@ POSE_RE = re.compile(
     r"^\s*(rx|ry|rz|tx|ty|tz)\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
 )
 ROI_RE = re.compile(r"--roi\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)")
+ML_TO_GUI_POSE_KEY = {
+    "rx": "init_rx",
+    "ry": "init_ry",
+    "rz": "init_rz",
+    "tx": "init_tx",
+    "ty": "init_ty",
+    "tz": "init_tz",
+}
 
 
 def default_python() -> str:
@@ -132,6 +140,8 @@ class RegistrationGui(Tk):
         }
         bool_defaults = {
             "use_ml_init": False,
+            "use_scale_ruler": True,
+            "fit_depth_without_ruler": True,
             "grid_search": False,
             "no_initial_preview": False,
             "preview_only": False,
@@ -328,21 +338,41 @@ class RegistrationGui(Tk):
 
     def _build_geometry_tab(self, parent: ttk.Frame) -> None:
         self._entry(parent, 0, "roi", "ROI x y w h (optional)", width=38)
-        self._entry(parent, 1, "scale_length_cm", "Scale length cm", width=18)
-        self._entry(parent, 2, "scale_points", "Scale points x1 y1 x2 y2", width=38)
-        self._entry(parent, 3, "pixel_spacing", "Pixel spacing mm", width=18)
-        self._entry(parent, 4, "stl_scale", "STL scale", width=18)
-        self._entry(parent, 5, "sdd", "Source-detector distance mm", width=18)
-        self._entry(parent, 6, "voxel_size", "Voxel size mm", width=18)
+        self._check(
+            parent,
+            1,
+            "use_scale_ruler",
+            "Calibrate from a visible scale/ruler on this X-ray",
+        )
+        self._entry(parent, 2, "scale_length_cm", "Scale length cm", width=18)
+        self._entry(parent, 3, "scale_points", "Scale points x1 y1 x2 y2", width=38)
+        self._entry(parent, 4, "pixel_spacing", "Detector pixel spacing mm/pixel", width=18)
+        self._check(
+            parent,
+            5,
+            "fit_depth_without_ruler",
+            "Without ruler, auto-fit depth to target segmentation (ROI fallback)",
+        )
+        self._entry(parent, 6, "stl_scale", "STL scale", width=18)
+        self._entry(parent, 7, "sdd", "Source-detector distance mm", width=18)
+        self._entry(parent, 8, "voxel_size", "Voxel size mm", width=18)
         self._choice(
             parent,
-            7,
+            9,
             "projection_mode",
             "Projection mode",
             ("silhouette", "attenuation"),
         )
-        self._entry(parent, 8, "silhouette_threshold", "Silhouette threshold")
-        self._entry(parent, 9, "silhouette_blur_sigma", "Silhouette blur sigma")
+        self._entry(parent, 10, "silhouette_threshold", "Silhouette threshold")
+        self._entry(parent, 11, "silhouette_blur_sigma", "Silhouette blur sigma")
+        ttk.Label(
+            parent,
+            text=(
+                "No ruler: untick the calibration box and enter pixel spacing "
+                "from the detector/DICOM metadata. Ruler fields will be ignored."
+            ),
+            foreground="#444",
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _build_pose_tab(self, parent: ttk.Frame) -> None:
         self._entry(parent, 0, "init_rx", "Initial rx deg")
@@ -451,7 +481,6 @@ class RegistrationGui(Tk):
             ("--stl_scale", "stl_scale"),
             ("--sdd", "sdd"),
             ("--pixel_spacing", "pixel_spacing"),
-            ("--scale_length_cm", "scale_length_cm"),
             ("--projection_mode", "projection_mode"),
             ("--silhouette_threshold", "silhouette_threshold"),
             ("--silhouette_blur_sigma", "silhouette_blur_sigma"),
@@ -490,6 +519,12 @@ class RegistrationGui(Tk):
             ("--ty_guard_mm", "ty_guard_mm"),
         ]
         for flag, name in scalar_args:
+            if (
+                name == "init_ty"
+                and not self.get_bool("use_scale_ruler")
+                and self.get_bool("fit_depth_without_ruler")
+            ):
+                continue
             override = overrides.get(name)
             self._add_value(
                 cmd,
@@ -498,9 +533,31 @@ class RegistrationGui(Tk):
                 override=override if isinstance(override, str) else None,
             )
 
-        scale_points = split_values(self.get("scale_points"), 4, "Scale points")
-        if scale_points:
-            cmd.extend(["--scale_points", *scale_points])
+        if self.get_bool("use_scale_ruler"):
+            self._add_value(
+                cmd,
+                "--scale_length_cm",
+                "scale_length_cm",
+                required=True,
+            )
+            scale_points = split_values(
+                self.get("scale_points"), 4, "Scale points"
+            )
+            if scale_points:
+                cmd.extend(["--scale_points", *scale_points])
+        else:
+            pixel_spacing = self.get("pixel_spacing")
+            try:
+                valid_spacing = float(pixel_spacing) > 0.0
+            except ValueError:
+                valid_spacing = False
+            if not valid_spacing:
+                raise ValueError(
+                    "Detector pixel spacing must be a positive mm/pixel value "
+                    "when ruler calibration is disabled"
+                )
+            if self.get_bool("fit_depth_without_ruler"):
+                cmd.append("--auto_fit_no_ruler")
 
         bool_args = [
             ("--grid_search", "grid_search"),
@@ -599,6 +656,16 @@ class RegistrationGui(Tk):
                 pose = self._parse_ml_pose(ml_output)
                 if pose:
                     for name, value in pose.items():
+                        if (
+                            name == "init_ty"
+                            and not self.get_bool("use_scale_ruler")
+                            and self.get_bool("fit_depth_without_ruler")
+                        ):
+                            self._queue_log(
+                                "[GUI] Ignoring ML ty so no-ruler depth can be "
+                                "fitted to segmentation/ROI.\n"
+                            )
+                            continue
                         text = f"{value:.6f}"
                         overrides[name] = text
                         self.after(0, self.vars[name].set, text)
@@ -652,7 +719,8 @@ class RegistrationGui(Tk):
         for line in output.splitlines():
             match = POSE_RE.match(line)
             if match:
-                pose[match.group(1)] = float(match.group(2))
+                gui_key = ML_TO_GUI_POSE_KEY[match.group(1)]
+                pose[gui_key] = float(match.group(2))
         return pose
 
     def _parse_roi(self, output: str) -> list[str]:
